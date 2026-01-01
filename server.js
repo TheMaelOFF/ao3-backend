@@ -15,30 +15,22 @@ const AXIOS_CONFIG = {
     }
 };
 
+// --- Helper: Scrape Search Results ---
 async function scrapeSearch(fullQuery) {
-    console.log(`[Proxy] Raw Query: ${fullQuery}`);
+    console.log(`[Proxy] Search Query: ${fullQuery}`);
     
-    // Default search params
-    let sortColumn = '_score'; // Best Match
+    let sortColumn = '_score'; 
     let sortDirection = 'desc';
     let ratingId = null;
     let isComplete = null;
     let cleanQuery = fullQuery;
 
-    // --- 1. Extract Sort ---
-    if (cleanQuery.includes('sort:kudos')) {
-        sortColumn = 'kudos_count';
-        cleanQuery = cleanQuery.replace('sort:kudos', '');
-    } else if (cleanQuery.includes('sort:hits')) {
-        sortColumn = 'hits';
-        cleanQuery = cleanQuery.replace('sort:hits', '');
-    } else if (cleanQuery.includes('sort:date')) {
-        sortColumn = 'revised_at';
-        cleanQuery = cleanQuery.replace('sort:date', '');
-    }
+    // 1. Extract Sort
+    if (cleanQuery.includes('sort:kudos')) { sortColumn = 'kudos_count'; cleanQuery = cleanQuery.replace('sort:kudos', ''); }
+    else if (cleanQuery.includes('sort:hits')) { sortColumn = 'hits'; cleanQuery = cleanQuery.replace('sort:hits', ''); }
+    else if (cleanQuery.includes('sort:date')) { sortColumn = 'revised_at'; cleanQuery = cleanQuery.replace('sort:date', ''); }
 
-    // --- 2. Extract Rating (Map Text to AO3 IDs) ---
-    // The frontend sends format: rating:"Explicit"
+    // 2. Extract Rating
     const ratingMatch = cleanQuery.match(/rating:"([^"]+)"/);
     if (ratingMatch) {
         const r = ratingMatch[1];
@@ -50,28 +42,23 @@ async function scrapeSearch(fullQuery) {
         cleanQuery = cleanQuery.replace(ratingMatch[0], '');
     }
 
-    // --- 3. Extract Complete Status ---
+    // 3. Extract Complete
     if (cleanQuery.includes('complete:true')) {
-        isComplete = 'T'; // AO3 uses 'T' for true
+        isComplete = 'T';
         cleanQuery = cleanQuery.replace('complete:true', '');
     }
 
-    // Clean up extra spaces
     cleanQuery = cleanQuery.trim();
 
-    // --- 4. Build the Precise URL ---
     const params = new URLSearchParams();
     params.append('commit', 'Search');
     params.append('work_search[query]', cleanQuery);
     params.append('work_search[sort_column]', sortColumn);
     params.append('work_search[sort_direction]', sortDirection);
-    
-    // Only append these if they were found
     if (ratingId) params.append('work_search[rating_ids]', ratingId);
     if (isComplete) params.append('work_search[complete]', isComplete);
 
     const url = `https://archiveofourown.org/works/search?${params.toString()}`;
-    console.log(`[Proxy] Target URL: ${url}`);
 
     try {
         const response = await axios.get(url, AXIOS_CONFIG);
@@ -104,20 +91,16 @@ async function scrapeSearch(fullQuery) {
                 });
             }
         });
-        
-        console.log(`[Proxy] Found ${results.length} results`);
         return results;
-
     } catch (err) {
-        console.error("[Proxy] AO3 Request Failed:", err.message);
+        console.error("[Proxy] Search Failed:", err.message);
         return [];
     }
 }
 
+// --- Helper: Scrape Full Work ---
 async function scrapeWork(id) {
-    console.log(`[Proxy] Fetching work ID: ${id}`);
     const url = `https://archiveofourown.org/works/${id}?view_full_work=true&view_adult=true`;
-    
     try {
         const { data } = await axios.get(url, AXIOS_CONFIG);
         const $ = cheerio.load(data);
@@ -139,22 +122,62 @@ async function scrapeWork(id) {
             chapters: content.length
         };
     } catch (err) {
-        console.error("[Proxy] Work Fetch Failed:", err.message);
         return { error: "Failed to load work" };
     }
 }
 
+// --- Helper: Scrape Popular Tags ---
+async function scrapePopularTags() {
+    try {
+        const { data } = await axios.get('https://archiveofourown.org/tags', AXIOS_CONFIG);
+        const $ = cheerio.load(data);
+        const tags = [];
+        // AO3 Tag Cloud
+        $('.cloud a').each((i, el) => {
+            tags.push($(el).text().trim());
+        });
+        // Return top 50 to keep it light
+        return tags.slice(0, 50);
+    } catch (e) {
+        console.error("[Proxy] Tag Cloud Failed");
+        return [];
+    }
+}
+
+// --- API Endpoints ---
 app.get('/', (req, res) => res.send('AO3 Proxy Online'));
 app.get('/status', (req, res) => res.json({ status: 'online' }));
+
 app.get('/search', async (req, res) => {
-    const query = req.query.q;
-    if (!query || !query.trim()) return res.json([]); 
-    const results = await scrapeSearch(query);
+    const results = await scrapeSearch(req.query.q || "");
     res.json(results);
 });
+
 app.get('/work/:id', async (req, res) => {
     const work = await scrapeWork(req.params.id);
     res.json(work);
+});
+
+// NEW: Get Popular Tags (for startup)
+app.get('/tags', async (req, res) => {
+    const tags = await scrapePopularTags();
+    res.json(tags);
+});
+
+// NEW: Real Autocomplete (Proxies AO3's internal API)
+app.get('/autocomplete', async (req, res) => {
+    const term = req.query.q;
+    if (!term) return res.json([]);
+    try {
+        // AO3 internal autocomplete endpoint
+        const url = `https://archiveofourown.org/autocomplete/tag?term=${encodeURIComponent(term)}`;
+        const { data } = await axios.get(url, AXIOS_CONFIG);
+        // Data comes back as [{ id: "tag name", name: "tag name" }, ...]
+        res.json(data);
+    } catch (e) {
+        console.error("[Proxy] Autocomplete Failed");
+        res.json([]);
+    }
 });
 
 app.listen(PORT, () => {
