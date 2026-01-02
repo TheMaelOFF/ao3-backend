@@ -1,7 +1,7 @@
 {
   "name": "ao3-proxy",
-  "version": "1.1.0",
-  "description": "Proxy server for AO3 Reader Optimized",
+  "version": "1.2.0",
+  "description": "Proxy server for AO3 Reader Turbo",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
