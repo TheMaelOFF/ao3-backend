@@ -5,34 +5,30 @@ const cheerio = require('cheerio');
 const https = require('https');
 const compression = require('compression');
 
-// NOTE : J'ai retiré la ligne 'dns.setServers' qui cause des ralentissements sur Render Cloud.
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Optimisation 1: Compression GZIP
-// Réduit la taille des données qui voyagent entre les USA et vous
+// Compression GZIP pour la vitesse
 app.use(compression({ level: 6 }));
 app.use(cors());
 
-// Optimisation 2: Agent HTTPS Persistant "Hybride"
-// On garde la ligne ouverte avec AO3 mais sans forcer le DNS
+// Optimisation : On garde la connexion ouverte
 const httpsAgent = new https.Agent({ 
     keepAlive: true, 
     keepAliveMsecs: 5000, 
-    maxSockets: 25,       // Équilibré pour la vitesse sans blocage
+    maxSockets: 25,
     maxFreeSockets: 10,
-    timeout: 30000        // 30s pour laisser une chance aux grosses recherches
+    timeout: 60000 // Augmenté à 60s pour le socket
 });
 
 const AXIOS_CONFIG = {
     httpsAgent: httpsAgent,
-    timeout: 30000, 
+    timeout: 60000, // MODIFIÉ ICI : 60 secondes (au lieu de 30s)
     headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Referer': 'https://archiveofourown.org/',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate', // Indispensable pour la vitesse
+        'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive'
     }
 };
@@ -48,6 +44,7 @@ async function scrapeSearch(fullQuery) {
     let isComplete = null;
     let cleanQuery = fullQuery || "";
 
+    // Filtres
     if (cleanQuery.includes('sort:kudos')) { sortColumn = 'kudos_count'; cleanQuery = cleanQuery.replace('sort:kudos', ''); }
     else if (cleanQuery.includes('sort:hits')) { sortColumn = 'hits'; cleanQuery = cleanQuery.replace('sort:hits', ''); }
     else if (cleanQuery.includes('sort:date')) { sortColumn = 'revised_at'; cleanQuery = cleanQuery.replace('sort:date', ''); }
@@ -61,6 +58,7 @@ async function scrapeSearch(fullQuery) {
 
     if (cleanQuery.includes('complete:true')) { isComplete = 'T'; cleanQuery = cleanQuery.replace('complete:true', ''); }
 
+    // Tags
     let extraTags = [];
     const tagMatches = cleanQuery.match(/tag:"([^"]+)"/g);
     if (tagMatches) {
@@ -105,7 +103,7 @@ async function scrapeSearch(fullQuery) {
                 fandom: $(el).find('.fandoms a').first().text().trim(),
                 rating: $(el).find('.rating .text').text().trim(),
                 relationships: $(el).find('.relationships a').map((_, a) => $(a).text().trim()).get(),
-                tags: $(el).find('.freeforms a').slice(0, 5).map((_, a) => $(a).text().trim()).get(), // Limite 5 tags pour vitesse
+                tags: $(el).find('.freeforms a').slice(0, 5).map((_, a) => $(a).text().trim()).get(),
                 summary: $(el).find('.summary blockquote').text().trim(),
                 words: parseInt(stats.find('dd.words').text().replace(/,/g, '')) || 0,
                 chapters: parseInt(stats.find('dd.chapters').text().split('/')[0]) || 1,
@@ -113,15 +111,15 @@ async function scrapeSearch(fullQuery) {
             });
         });
         
-        console.log(`[Perf] ${results.length} résultats en ${(Date.now() - start)}ms`);
+        console.log(`[Perf] Recherche terminée en ${(Date.now() - start)}ms`);
         return results;
     } catch (err) {
-        console.error("[Proxy] Erreur:", err.message);
+        console.error("[Proxy] Erreur (Timeout probable):", err.message);
         return [];
     }
 }
 
-// --- LOGIQUE DE LECTURE ---
+// --- LECTURE ---
 async function scrapeWork(id) {
     const url = `https://archiveofourown.org/works/${id}?view_full_work=true&view_adult=true`;
     try {
@@ -153,7 +151,7 @@ async function getAutocomplete(term) {
         ...AXIOS_CONFIG,
         headers: { 
             ...AXIOS_CONFIG.headers, 
-            'X-Requested-With': 'XMLHttpRequest',
+            'X-Requested-With': 'XMLHttpRequest', 
             'Accept': 'application/json'
         }
     };
@@ -174,7 +172,7 @@ async function scrapePopularTags() {
 }
 
 // --- ROUTES ---
-app.get('/', (req, res) => res.send('AO3 Proxy V3'));
+app.get('/', (req, res) => res.send('AO3 Proxy V4 (60s Timeout)'));
 app.get('/status', (req, res) => res.json({ status: 'online', time: Date.now() }));
 
 app.get('/search', async (req, res) => {
@@ -199,7 +197,7 @@ app.get('/autocomplete', async (req, res) => {
     res.json(results);
 });
 
-// Petit Ping interne pour aider UptimeRobot
+// Ping Interne
 setInterval(() => {
     axios.get(`http://localhost:${PORT}/status`).catch(() => {});
 }, 5 * 60 * 1000);
