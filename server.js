@@ -5,45 +5,49 @@ const cheerio = require('cheerio');
 const https = require('https');
 const compression = require('compression');
 
-// On retire le DNS manuel qui causait des conflits sur Render
+// NOTE : J'ai retiré la ligne 'dns.setServers' qui cause des ralentissements sur Render Cloud.
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Compression GZIP standard (niveau par défaut est suffisant et utilise moins de CPU)
-app.use(compression());
+// Optimisation 1: Compression GZIP
+// Réduit la taille des données qui voyagent entre les USA et vous
+app.use(compression({ level: 6 }));
 app.use(cors());
 
-// Optimisation Réseau : Agent Keep-Alive ÉQUILIBRÉ
+// Optimisation 2: Agent HTTPS Persistant "Hybride"
+// On garde la ligne ouverte avec AO3 mais sans forcer le DNS
 const httpsAgent = new https.Agent({ 
     keepAlive: true, 
-    keepAliveMsecs: 10000, // On garde la connexion plus longtemps
-    maxSockets: 10,        // Suffisant pour un utilisateur, évite le blocage AO3
-    maxFreeSockets: 5,
-    timeout: 30000         // Timeout socket plus tolérant
+    keepAliveMsecs: 5000, 
+    maxSockets: 25,       // Équilibré pour la vitesse sans blocage
+    maxFreeSockets: 10,
+    timeout: 30000        // 30s pour laisser une chance aux grosses recherches
 });
 
 const AXIOS_CONFIG = {
     httpsAgent: httpsAgent,
-    timeout: 25000, // On laisse 25s max (compromis entre vitesse et patience)
+    timeout: 30000, 
     headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; ArchiveReader/2.0)',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Referer': 'https://archiveofourown.org/',
-        'Connection': 'keep-alive',
-        'Accept-Encoding': 'gzip, deflate',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate', // Indispensable pour la vitesse
+        'Connection': 'keep-alive'
     }
 };
 
-// --- 1. RECHERCHE ---
+// --- LOGIQUE DE RECHERCHE ---
 async function scrapeSearch(fullQuery) {
     const start = Date.now();
+    console.log(`[Proxy] Recherche: ${fullQuery}`);
+    
     let sortColumn = '_score'; 
     let sortDirection = 'desc';
     let ratingId = null;
     let isComplete = null;
     let cleanQuery = fullQuery || "";
 
-    // Filtres
     if (cleanQuery.includes('sort:kudos')) { sortColumn = 'kudos_count'; cleanQuery = cleanQuery.replace('sort:kudos', ''); }
     else if (cleanQuery.includes('sort:hits')) { sortColumn = 'hits'; cleanQuery = cleanQuery.replace('sort:hits', ''); }
     else if (cleanQuery.includes('sort:date')) { sortColumn = 'revised_at'; cleanQuery = cleanQuery.replace('sort:date', ''); }
@@ -57,7 +61,6 @@ async function scrapeSearch(fullQuery) {
 
     if (cleanQuery.includes('complete:true')) { isComplete = 'T'; cleanQuery = cleanQuery.replace('complete:true', ''); }
 
-    // Tags
     let extraTags = [];
     const tagMatches = cleanQuery.match(/tag:"([^"]+)"/g);
     if (tagMatches) {
@@ -94,9 +97,7 @@ async function scrapeSearch(fullQuery) {
             if (!titleElement.length) return;
 
             const stats = $(el).find('dl.stats');
-            const words = parseInt(stats.find('dd.words').text().replace(/,/g, '')) || 0;
-            const chapters = parseInt(stats.find('dd.chapters').text().split('/')[0]) || 1;
-
+            
             results.push({
                 id: titleElement.attr('href')?.split('/')[2],
                 title: titleElement.text().trim(),
@@ -104,15 +105,15 @@ async function scrapeSearch(fullQuery) {
                 fandom: $(el).find('.fandoms a').first().text().trim(),
                 rating: $(el).find('.rating .text').text().trim(),
                 relationships: $(el).find('.relationships a').map((_, a) => $(a).text().trim()).get(),
-                tags: $(el).find('.freeforms a').slice(0, 5).map((_, a) => $(a).text().trim()).get(),
+                tags: $(el).find('.freeforms a').slice(0, 5).map((_, a) => $(a).text().trim()).get(), // Limite 5 tags pour vitesse
                 summary: $(el).find('.summary blockquote').text().trim(),
-                words,
-                chapters,
+                words: parseInt(stats.find('dd.words').text().replace(/,/g, '')) || 0,
+                chapters: parseInt(stats.find('dd.chapters').text().split('/')[0]) || 1,
                 updated: $(el).find('p.datetime').text().trim()
             });
         });
         
-        console.log(`[Perf] Recherche ${results.length} items en ${(Date.now() - start)}ms`);
+        console.log(`[Perf] ${results.length} résultats en ${(Date.now() - start)}ms`);
         return results;
     } catch (err) {
         console.error("[Proxy] Erreur:", err.message);
@@ -120,7 +121,7 @@ async function scrapeSearch(fullQuery) {
     }
 }
 
-// --- 2. LECTURE ---
+// --- LOGIQUE DE LECTURE ---
 async function scrapeWork(id) {
     const url = `https://archiveofourown.org/works/${id}?view_full_work=true&view_adult=true`;
     try {
@@ -146,18 +147,18 @@ async function scrapeWork(id) {
     }
 }
 
-// --- 3. AUTOCOMPLETE ---
+// --- AUTOCOMPLETE ---
 async function getAutocomplete(term) {
-    const config = {
+    const ajaxConfig = {
         ...AXIOS_CONFIG,
         headers: { 
             ...AXIOS_CONFIG.headers, 
-            'X-Requested-With': 'XMLHttpRequest', 
+            'X-Requested-With': 'XMLHttpRequest',
             'Accept': 'application/json'
         }
     };
     try {
-        const { data } = await axios.get(`https://archiveofourown.org/autocomplete/tag?term=${encodeURIComponent(term)}`, config);
+        const { data } = await axios.get(`https://archiveofourown.org/autocomplete/tag?term=${encodeURIComponent(term)}`, ajaxConfig);
         return Array.isArray(data) ? data : [];
     } catch (e) { return []; }
 }
@@ -173,7 +174,7 @@ async function scrapePopularTags() {
 }
 
 // --- ROUTES ---
-app.get('/', (req, res) => res.send('AO3 Proxy Stable'));
+app.get('/', (req, res) => res.send('AO3 Proxy V3'));
 app.get('/status', (req, res) => res.json({ status: 'online', time: Date.now() }));
 
 app.get('/search', async (req, res) => {
@@ -198,7 +199,7 @@ app.get('/autocomplete', async (req, res) => {
     res.json(results);
 });
 
-// Auto-Ping toutes les 5 min (Garde le serveur en vie tant qu'il y a du trafic interne)
+// Petit Ping interne pour aider UptimeRobot
 setInterval(() => {
     axios.get(`http://localhost:${PORT}/status`).catch(() => {});
 }, 5 * 60 * 1000);
