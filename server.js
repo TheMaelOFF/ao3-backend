@@ -4,80 +4,75 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const https = require('https');
 const compression = require('compression');
+const dns = require('dns');
+
+// Cache DNS pour gagner 200ms
+try { dns.setServers(['8.8.8.8', '1.1.1.1']); } catch(e) {}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 1. OPTIMISATION : Compression GZIP pour réduire la taille des réponses (texte/html/json)
-app.use(compression());
+// Compression GZIP maximale
+app.use(compression({ level: 6 }));
 app.use(cors());
 
-// 2. OPTIMISATION : Agent HTTPS Keep-Alive
-// Garde la connexion ouverte avec AO3 pour éviter de refaire le handshake SSL à chaque recherche.
+// Optimisation Réseau : Agent Keep-Alive
 const httpsAgent = new https.Agent({ 
     keepAlive: true, 
-    maxSockets: 10, 
-    freeSocketTimeout: 30000 
+    keepAliveMsecs: 3000,
+    maxSockets: 50, 
+    maxFreeSockets: 10,
+    timeout: 15000, 
+    scheduling: 'lifo'
 });
 
-// Configuration Axios Globale
 const AXIOS_CONFIG = {
-    httpsAgent: httpsAgent, // Utilise l'agent optimisé
+    httpsAgent: httpsAgent,
+    timeout: 15000, // Timeout 15s
     headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (compatible; ArchiveReader/2.0)',
         'Referer': 'https://archiveofourown.org/',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Connection': 'keep-alive' // Demande à AO3 de garder la ligne ouverte
-    },
-    timeout: 15000 // Timeout de 15s pour ne pas bloquer indéfiniment
+        'Connection': 'keep-alive',
+        'Accept-Encoding': 'gzip, deflate',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    }
 };
 
-// --- LOGIQUE DE RECHERCHE AVANCÉE ---
+// --- 1. RECHERCHE OPTIMISÉE ---
 async function scrapeSearch(fullQuery) {
-    console.log(`[Proxy] Recherche: ${fullQuery}`);
-    
+    const start = Date.now();
     let sortColumn = '_score'; 
     let sortDirection = 'desc';
     let ratingId = null;
     let isComplete = null;
     let cleanQuery = fullQuery || "";
 
-    // Extraction des filtres spéciaux
+    // Filtres
     if (cleanQuery.includes('sort:kudos')) { sortColumn = 'kudos_count'; cleanQuery = cleanQuery.replace('sort:kudos', ''); }
     else if (cleanQuery.includes('sort:hits')) { sortColumn = 'hits'; cleanQuery = cleanQuery.replace('sort:hits', ''); }
     else if (cleanQuery.includes('sort:date')) { sortColumn = 'revised_at'; cleanQuery = cleanQuery.replace('sort:date', ''); }
 
     const ratingMatch = cleanQuery.match(/rating:"([^"]+)"/);
     if (ratingMatch) {
-        const r = ratingMatch[1];
-        if (r === 'Not Rated') ratingId = '9';
-        if (r === 'General Audiences') ratingId = '10';
-        if (r === 'Teen And Up Audiences') ratingId = '11';
-        if (r === 'Mature') ratingId = '12';
-        if (r === 'Explicit') ratingId = '13';
+        const map = { 'Not Rated': '9', 'General Audiences': '10', 'Teen And Up Audiences': '11', 'Mature': '12', 'Explicit': '13' };
+        ratingId = map[ratingMatch[1]];
         cleanQuery = cleanQuery.replace(ratingMatch[0], '');
     }
 
-    if (cleanQuery.includes('complete:true')) {
-        isComplete = 'T';
-        cleanQuery = cleanQuery.replace('complete:true', '');
-    }
+    if (cleanQuery.includes('complete:true')) { isComplete = 'T'; cleanQuery = cleanQuery.replace('complete:true', ''); }
 
-    // Gestion des tags spécifiques (tag:"Nom")
-    const tagMatches = cleanQuery.match(/tag:"([^"]+)"/g);
+    // Tags
     let extraTags = [];
+    const tagMatches = cleanQuery.match(/tag:"([^"]+)"/g);
     if (tagMatches) {
         tagMatches.forEach(t => {
-            const tagName = t.match(/tag:"([^"]+)"/)[1];
-            extraTags.push(tagName);
+            extraTags.push(t.match(/tag:"([^"]+)"/)[1]);
             cleanQuery = cleanQuery.replace(t, '');
         });
     }
 
     cleanQuery = cleanQuery.trim();
 
-    // Construction de l'URL AO3
     const params = new URLSearchParams();
     params.append('commit', 'Search');
     params.append('work_search[query]', cleanQuery);
@@ -86,10 +81,9 @@ async function scrapeSearch(fullQuery) {
     if (ratingId) params.append('work_search[rating_ids]', ratingId);
     if (isComplete) params.append('work_search[complete]', isComplete);
     
-    // Ajout des tags supplémentaires
     if (extraTags.length > 0) {
-        const currentQ = params.get('work_search[query]');
-        params.set('work_search[query]', (currentQ ? currentQ + ' ' : '') + extraTags.join(' '));
+        const q = params.get('work_search[query]');
+        params.set('work_search[query]', (q ? q + ' ' : '') + extraTags.join(' '));
     }
 
     const url = `https://archiveofourown.org/works/search?${params.toString()}`;
@@ -103,37 +97,34 @@ async function scrapeSearch(fullQuery) {
             const titleElement = $(el).find('.heading a').first();
             if (!titleElement.length) return;
 
-            const href = titleElement.attr('href');
-            const id = href ? href.match(/\/works\/(\d+)/)?.[1] : null;
+            const stats = $(el).find('dl.stats');
+            const words = parseInt(stats.find('dd.words').text().replace(/,/g, '')) || 0;
+            const chapters = parseInt(stats.find('dd.chapters').text().split('/')[0]) || 1;
 
-            if (id) {
-                const wordsTxt = $(el).find('dd.words').text().replace(/,/g, '');
-                const chaptersTxt = $(el).find('dd.chapters').text().split('/')[0];
-                const ratingText = $(el).find('.rating .text').text().trim();
-
-                results.push({
-                    id,
-                    title: titleElement.text().trim(),
-                    author: $(el).find('.heading a[rel="author"]').text().trim() || "Anonymous",
-                    fandom: $(el).find('.fandoms a').first().text().trim(),
-                    rating: ratingText,
-                    relationships: $(el).find('.relationships a').map((_, a) => $(a).text().trim()).get(),
-                    tags: $(el).find('.freeforms a').map((_, a) => $(a).text().trim()).get(),
-                    summary: $(el).find('.summary blockquote').text().trim(),
-                    words: parseInt(wordsTxt) || 0,
-                    chapters: parseInt(chaptersTxt) || 1,
-                    updated: $(el).find('p.datetime').text().trim()
-                });
-            }
+            results.push({
+                id: titleElement.attr('href')?.split('/')[2],
+                title: titleElement.text().trim(),
+                author: $(el).find('.heading a[rel="author"]').text().trim() || "Anonymous",
+                fandom: $(el).find('.fandoms a').first().text().trim(),
+                rating: $(el).find('.rating .text').text().trim(),
+                relationships: $(el).find('.relationships a').map((_, a) => $(a).text().trim()).get(),
+                tags: $(el).find('.freeforms a').slice(0, 5).map((_, a) => $(a).text().trim()).get(),
+                summary: $(el).find('.summary blockquote').text().trim(),
+                words,
+                chapters,
+                updated: $(el).find('p.datetime').text().trim()
+            });
         });
+        
+        console.log(`[Perf] Recherche ${results.length} items en ${(Date.now() - start)}ms`);
         return results;
     } catch (err) {
-        console.error("[Proxy] Erreur Recherche:", err.message);
+        console.error("[Proxy] Erreur:", err.message);
         return [];
     }
 }
 
-// --- LOGIQUE DE LECTURE (Chapitres) ---
+// --- 2. LECTURE ---
 async function scrapeWork(id) {
     const url = `https://archiveofourown.org/works/${id}?view_full_work=true&view_adult=true`;
     try {
@@ -155,52 +146,43 @@ async function scrapeWork(id) {
             chapters: content.length
         };
     } catch (err) {
-        return { error: "Impossible de charger l'œuvre." };
+        return { error: "Erreur chargement" };
     }
 }
 
-// --- LOGIQUE AUTOCOMPLETE (Avec fix X-Requested-With) ---
+// --- 3. AUTOCOMPLETE (FIX) ---
 async function getAutocomplete(term) {
-    const ajaxConfig = {
+    const config = {
         ...AXIOS_CONFIG,
-        headers: {
-            ...AXIOS_CONFIG.headers,
-            'X-Requested-With': 'XMLHttpRequest', 
+        headers: { 
+            ...AXIOS_CONFIG.headers, 
+            'X-Requested-With': 'XMLHttpRequest', // Obligatoire
             'Accept': 'application/json'
         }
     };
-    
-    const url = `https://archiveofourown.org/autocomplete/tag?term=${encodeURIComponent(term)}`;
-    
     try {
-        const { data } = await axios.get(url, ajaxConfig);
-        if (Array.isArray(data)) return data;
-        return [];
-    } catch (e) {
-        console.error(`[Proxy] Erreur Autocomplete:`, e.message);
-        return [];
-    }
+        const { data } = await axios.get(`https://archiveofourown.org/autocomplete/tag?term=${encodeURIComponent(term)}`, config);
+        return Array.isArray(data) ? data : [];
+    } catch (e) { return []; }
 }
 
-// --- LOGIQUE TAGS POPULAIRES ---
 async function scrapePopularTags() {
     try {
         const { data } = await axios.get('https://archiveofourown.org/tags', AXIOS_CONFIG);
         const $ = cheerio.load(data);
         const tags = [];
-        $('.cloud a').each((i, el) => tags.push($(el).text().trim()));
-        return tags.slice(0, 50);
-    } catch (e) {
-        return [];
-    }
+        $('.cloud a').slice(0, 50).each((i, el) => tags.push($(el).text().trim()));
+        return tags;
+    } catch (e) { return []; }
 }
 
-// --- ROUTES API ---
-app.get('/', (req, res) => res.send('AO3 Proxy Optimized - Online'));
-app.get('/status', (req, res) => res.json({ status: 'online' }));
+// --- ROUTES ---
+app.get('/', (req, res) => res.send('AO3 Turbo Proxy V5'));
+app.get('/status', (req, res) => res.json({ status: 'online', time: Date.now() }));
 
 app.get('/search', async (req, res) => {
-    const results = await scrapeSearch(req.query.q || "");
+    if (!req.query.q || req.query.q.trim().length === 0) return res.json([]);
+    const results = await scrapeSearch(req.query.q);
     res.json(results);
 });
 
@@ -215,11 +197,15 @@ app.get('/tags', async (req, res) => {
 });
 
 app.get('/autocomplete', async (req, res) => {
-    const term = req.query.q;
-    if (!term || term.length < 2) return res.json([]);
-    const results = await getAutocomplete(term);
+    if (!req.query.q || req.query.q.length < 2) return res.json([]);
+    const results = await getAutocomplete(req.query.q);
     res.json(results);
 });
+
+// Auto-Ping toutes les 5 min
+setInterval(() => {
+    axios.get(`http://localhost:${PORT}/status`).catch(() => {});
+}, 5 * 60 * 1000);
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
