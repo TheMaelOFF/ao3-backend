@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const https = require('https'); // Réintégration du module HTTPS
+const https = require('https');
 const compression = require('compression');
 
 const app = express();
@@ -11,14 +11,14 @@ const PORT = process.env.PORT || 3000;
 app.use(compression({ level: 6 }));
 app.use(cors());
 
-// --- OPTIMISATION RÉSEAU (Le retour du Keep-Alive) ---
-// On crée un agent qui maintient la ligne ouverte avec AO3
+// --- OPTIMISATION : Mode "Discret" ---
+// On réduit drastiquement le nombre de connexions pour ne pas énerver AO3
 const httpsAgent = new https.Agent({ 
     keepAlive: true, 
-    keepAliveMsecs: 3000, // On garde la connexion chaude
-    maxSockets: 50,       // On autorise plus de connexions simultanées
-    maxFreeSockets: 10,
-    timeout: 60000        // 60s avant d'abandonner
+    keepAliveMsecs: 5000, 
+    maxSockets: 5,        // RÉDUIT : 5 au lieu de 50 (évite le ban)
+    maxFreeSockets: 2,
+    timeout: 60000
 });
 
 const AXIOS_CONFIG = {
@@ -29,14 +29,32 @@ const AXIOS_CONFIG = {
         'Referer': 'https://archiveofourown.org/',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive' // CRUCIAL : On ne raccroche pas !
+        'Connection': 'keep-alive'
     }
 };
+
+// --- SYSTÈME DE RÉESSAI INTELLIGENT ---
+// Si on prend un 429 (Trop de requêtes), on attend et on réessaie.
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function fetchWithRetry(url, config = AXIOS_CONFIG, retries = 3) {
+    try {
+        return await axios.get(url, config);
+    } catch (error) {
+        // Si erreur 429 (Trop vite) ou 503 (Surcharge AO3)
+        if (error.response && (error.response.status === 429 || error.response.status === 503) && retries > 0) {
+            console.log(`[Proxy] AO3 dit "Trop vite" (429). Pause de 5s... (${retries} essais restants)`);
+            await delay(5000 + Math.random() * 2000); // Attente aléatoire entre 5s et 7s
+            return fetchWithRetry(url, config, retries - 1);
+        }
+        throw error;
+    }
+}
 
 // --- RECHERCHE ---
 async function scrapeSearch(fullQuery) {
     const startTotal = Date.now();
-    console.log(`[Proxy] Démarrage recherche: "${fullQuery}"`);
+    console.log(`[Proxy] Recherche: "${fullQuery}"`);
     
     let sortColumn = '_score'; 
     let sortDirection = 'desc';
@@ -44,7 +62,6 @@ async function scrapeSearch(fullQuery) {
     let isComplete = null;
     let cleanQuery = fullQuery || "";
 
-    // 1. Parsing
     if (cleanQuery.includes('sort:kudos')) { sortColumn = 'kudos_count'; cleanQuery = cleanQuery.replace('sort:kudos', ''); }
     else if (cleanQuery.includes('sort:hits')) { sortColumn = 'hits'; cleanQuery = cleanQuery.replace('sort:hits', ''); }
     else if (cleanQuery.includes('sort:date')) { sortColumn = 'revised_at'; cleanQuery = cleanQuery.replace('sort:date', ''); }
@@ -83,14 +100,9 @@ async function scrapeSearch(fullQuery) {
     const url = `https://archiveofourown.org/works/search?${params.toString()}`;
 
     try {
-        // 2. Téléchargement
-        const startNet = Date.now();
-        const response = await axios.get(url, AXIOS_CONFIG);
-        const netTime = Date.now() - startNet;
-        console.log(`[Perf] Téléchargement AO3: ${netTime}ms`);
-
-        // 3. Analyse HTML
-        const startParse = Date.now();
+        // Utilisation du fetch intelligent
+        const response = await fetchWithRetry(url);
+        
         const $ = cheerio.load(response.data);
         const results = [];
 
@@ -115,12 +127,11 @@ async function scrapeSearch(fullQuery) {
             });
         });
         
-        console.log(`[Perf] Parsing HTML: ${(Date.now() - startParse)}ms`);
-        console.log(`[Perf] TEMPS TOTAL: ${(Date.now() - startTotal)}ms`);
+        console.log(`[Perf] OK (${results.length} items) en ${(Date.now() - startTotal)}ms`);
         return results;
 
     } catch (err) {
-        console.error("[Proxy] Erreur:", err.message);
+        console.error("[Proxy] Échec final:", err.message);
         return [];
     }
 }
@@ -128,8 +139,8 @@ async function scrapeSearch(fullQuery) {
 // --- LECTURE ---
 async function scrapeWork(id) {
     try {
-        const { data } = await axios.get(`https://archiveofourown.org/works/${id}?view_full_work=true&view_adult=true`, AXIOS_CONFIG);
-        const $ = cheerio.load(data);
+        const response = await fetchWithRetry(`https://archiveofourown.org/works/${id}?view_full_work=true&view_adult=true`);
+        const $ = cheerio.load(response.data);
         
         let content = [];
         const nodes = $('#chapters').length ? $('#chapters .userstuff') : $('.userstuff');
@@ -143,14 +154,18 @@ async function scrapeWork(id) {
             chapters: content.length
         };
     } catch (err) {
-        return { error: "Erreur" };
+        return { error: "Erreur chargement" };
     }
 }
 
 // --- AUTOCOMPLETE ---
 async function getAutocomplete(term) {
+    const config = { 
+        ...AXIOS_CONFIG, 
+        headers: { ...AXIOS_CONFIG.headers, 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' } 
+    };
     try {
-        const config = { ...AXIOS_CONFIG, headers: { ...AXIOS_CONFIG.headers, 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' } };
+        // On n'utilise pas le retry ici pour aller vite (l'autocomplete doit être instantané)
         const { data } = await axios.get(`https://archiveofourown.org/autocomplete/tag?term=${encodeURIComponent(term)}`, config);
         return Array.isArray(data) ? data : [];
     } catch (e) { return []; }
@@ -158,8 +173,8 @@ async function getAutocomplete(term) {
 
 async function scrapePopularTags() {
     try {
-        const { data } = await axios.get('https://archiveofourown.org/tags', AXIOS_CONFIG);
-        const $ = cheerio.load(data);
+        const response = await fetchWithRetry('https://archiveofourown.org/tags');
+        const $ = cheerio.load(response.data);
         const tags = [];
         $('.cloud a').slice(0, 50).each((i, el) => tags.push($(el).text().trim()));
         return tags;
@@ -167,12 +182,8 @@ async function scrapePopularTags() {
 }
 
 // --- ROUTES ---
-app.get('/', (req, res) => res.send('AO3 Proxy V6 - Fast Lane'));
-app.get('/status', (req, res) => {
-    // Petit log pour voir quand UptimeRobot tape
-    // console.log("[Ping] Keep-Alive check"); 
-    res.json({ status: 'online', time: Date.now() });
-});
+app.get('/', (req, res) => res.send('AO3 Proxy V7 (Anti-429)'));
+app.get('/status', (req, res) => res.json({ status: 'online', time: Date.now() }));
 
 app.get('/search', async (req, res) => {
     if (!req.query.q) return res.json([]);
@@ -195,10 +206,10 @@ app.get('/autocomplete', async (req, res) => {
     res.json(results);
 });
 
-// Auto-ping interne (ceinture et bretelles avec UptimeRobot)
+// Ping
 setInterval(() => {
     axios.get(`http://localhost:${PORT}/status`).catch(() => {});
-}, 4 * 60 * 1000); // 4 minutes
+}, 4 * 60 * 1000);
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
