@@ -2,22 +2,34 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const https = require('https'); // Réintégration du module HTTPS
 const compression = require('compression');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(compression());
+app.use(compression({ level: 6 }));
 app.use(cors());
 
-// Configuration Standard (Sans agent complexe qui bloque parfois)
+// --- OPTIMISATION RÉSEAU (Le retour du Keep-Alive) ---
+// On crée un agent qui maintient la ligne ouverte avec AO3
+const httpsAgent = new https.Agent({ 
+    keepAlive: true, 
+    keepAliveMsecs: 3000, // On garde la connexion chaude
+    maxSockets: 50,       // On autorise plus de connexions simultanées
+    maxFreeSockets: 10,
+    timeout: 60000        // 60s avant d'abandonner
+});
+
 const AXIOS_CONFIG = {
-    timeout: 45000, // 45 secondes max
+    httpsAgent: httpsAgent,
+    timeout: 60000, 
     headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Referer': 'https://archiveofourown.org/',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Connection': 'close' // On ferme pour éviter les sockets fantômes sur Render Free
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive' // CRUCIAL : On ne raccroche pas !
     }
 };
 
@@ -32,7 +44,7 @@ async function scrapeSearch(fullQuery) {
     let isComplete = null;
     let cleanQuery = fullQuery || "";
 
-    // 1. Parsing (Rapide)
+    // 1. Parsing
     if (cleanQuery.includes('sort:kudos')) { sortColumn = 'kudos_count'; cleanQuery = cleanQuery.replace('sort:kudos', ''); }
     else if (cleanQuery.includes('sort:hits')) { sortColumn = 'hits'; cleanQuery = cleanQuery.replace('sort:hits', ''); }
     else if (cleanQuery.includes('sort:date')) { sortColumn = 'revised_at'; cleanQuery = cleanQuery.replace('sort:date', ''); }
@@ -71,12 +83,13 @@ async function scrapeSearch(fullQuery) {
     const url = `https://archiveofourown.org/works/search?${params.toString()}`;
 
     try {
-        // 2. Téléchargement (Le goulot d'étranglement habituel)
+        // 2. Téléchargement
         const startNet = Date.now();
         const response = await axios.get(url, AXIOS_CONFIG);
-        console.log(`[Perf] Téléchargement AO3: ${(Date.now() - startNet)}ms`);
+        const netTime = Date.now() - startNet;
+        console.log(`[Perf] Téléchargement AO3: ${netTime}ms`);
 
-        // 3. Analyse HTML (CPU)
+        // 3. Analyse HTML
         const startParse = Date.now();
         const $ = cheerio.load(response.data);
         const results = [];
@@ -154,9 +167,10 @@ async function scrapePopularTags() {
 }
 
 // --- ROUTES ---
-app.get('/', (req, res) => res.send('AO3 Proxy V5 - Ready'));
+app.get('/', (req, res) => res.send('AO3 Proxy V6 - Fast Lane'));
 app.get('/status', (req, res) => {
-    console.log("[Ping] Vérification statut reçu");
+    // Petit log pour voir quand UptimeRobot tape
+    // console.log("[Ping] Keep-Alive check"); 
     res.json({ status: 'online', time: Date.now() });
 });
 
@@ -180,6 +194,11 @@ app.get('/autocomplete', async (req, res) => {
     const results = await getAutocomplete(req.query.q);
     res.json(results);
 });
+
+// Auto-ping interne (ceinture et bretelles avec UptimeRobot)
+setInterval(() => {
+    axios.get(`http://localhost:${PORT}/status`).catch(() => {});
+}, 4 * 60 * 1000); // 4 minutes
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
